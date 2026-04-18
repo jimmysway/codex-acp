@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     ops::DerefMut,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock, Mutex},
 };
@@ -2797,7 +2797,35 @@ fn absolutize_patch_path(cwd: &Path, path: &Path) -> PathBuf {
 }
 
 fn path_is_within_root(path: &Path, root: &Path) -> bool {
-    path == root || path.starts_with(root)
+    let Some(normalized_path) = normalize_path_for_root_check(path) else {
+        return false;
+    };
+    let Some(normalized_root) = normalize_path_for_root_check(root) else {
+        return false;
+    };
+
+    normalized_path == normalized_root || normalized_path.starts_with(&normalized_root)
+}
+
+fn normalize_path_for_root_check(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    Some(normalized)
 }
 
 struct ThreadActor<A> {
@@ -5688,6 +5716,54 @@ mod tests {
                     move_path: None,
                 },
             )]),
+        );
+
+        fs::write(&outside_path, "new\n")?;
+
+        let client = Arc::new(StubClient::new());
+        let session_client = test_session_client(client.clone(), true);
+        pending
+            .replay(&session_client)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(fs::read_to_string(&outside_path)?, "new\n");
+        assert!(client.write_text_file_requests.lock().unwrap().is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_patch_replay_skips_paths_that_escape_session_root() -> anyhow::Result<()>
+    {
+        let temp_dir = test_temp_dir("replay-escape-root");
+        let outside_dir = test_temp_dir("replay-escape-outside");
+        let outside_path = outside_dir.join("outside.txt");
+        fs::write(&outside_path, "old\n")?;
+
+        let relative_escape = PathBuf::from(format!(
+            "../{}/outside.txt",
+            outside_dir.file_name().unwrap().to_string_lossy()
+        ));
+
+        let pending = PendingPatchReplay::capture(
+            &temp_dir,
+            &HashMap::from([(
+                relative_escape,
+                FileChange::Update {
+                    unified_diff: String::new(),
+                    move_path: None,
+                },
+            )]),
+        );
+
+        assert!(pending.files.is_empty());
+        assert_eq!(
+            pending.skipped_paths(),
+            &[temp_dir
+                .join("../")
+                .join(outside_dir.file_name().unwrap())
+                .join("outside.txt")]
         );
 
         fs::write(&outside_path, "new\n")?;
