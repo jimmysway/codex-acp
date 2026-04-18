@@ -3535,12 +3535,15 @@ impl<A: Auth> ThreadActor<A> {
                             }],
                             final_output_json_schema: None,
                         }
-                    } else if self.skills.borrow().iter().any(|skill| skill.name == name) {
+                    } else if let Some(skill) = self
+                        .skills
+                        .borrow()
+                        .iter()
+                        .find(|skill| skill.name == name)
+                        .cloned()
+                    {
                         op = Op::UserInput {
-                            items: vec![UserInput::Text {
-                                text: skill_command_prompt(name, rest),
-                                text_elements: vec![],
-                            }],
+                            items: skill_command_items(&skill, rest),
                             final_output_json_schema: None,
                         }
                     } else {
@@ -4384,12 +4387,21 @@ fn flatten_enabled_user_visible_skills(
     skills
 }
 
-fn skill_command_prompt(name: &str, rest: &str) -> String {
-    if rest.trim().is_empty() {
-        format!("Use the `{name}` skill for this request.")
-    } else {
-        format!("Use the `{name}` skill for this request.\n\nArguments or mode: {rest}")
+fn skill_command_items(skill: &SkillMetadata, rest: &str) -> Vec<UserInput> {
+    let mut items = vec![UserInput::Skill {
+        name: skill.name.clone(),
+        path: skill.path.clone(),
+    }];
+
+    let rest = rest.trim();
+    if !rest.is_empty() {
+        items.push(UserInput::Text {
+            text: rest.to_string(),
+            text_elements: vec![],
+        });
     }
+
+    items
 }
 
 #[cfg(test)]
@@ -4897,14 +4909,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_skill_slash_command_expands_to_user_prompt() -> anyhow::Result<()> {
-        let skill = test_skill("teach-impeccable");
-        let (session_id, client, thread, message_tx, local_set) =
+    async fn test_skill_slash_command_attaches_skill_input() -> anyhow::Result<()> {
+        let skill = test_skill("design-skill");
+        let skill_path = skill.path.clone();
+        let (session_id, _client, thread, message_tx, local_set) =
             setup_with_skills(vec![], vec![skill]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
-            request: PromptRequest::new(session_id.clone(), vec!["/teach-impeccable".into()]),
+            request: PromptRequest::new(session_id.clone(), vec!["/design-skill setup".into()]),
             response_tx: prompt_response_tx,
         })?;
 
@@ -4921,23 +4934,71 @@ mod tests {
             }
         )?;
 
-        let notifications = client.notifications.lock().unwrap();
-        assert!(matches!(
-            &notifications[0].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Use the `teach-impeccable` skill for this request."
-        ));
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::UserInput {
+                items: vec![
+                    UserInput::Skill {
+                        name: "design-skill".into(),
+                        path: skill_path,
+                    },
+                    UserInput::Text {
+                        text: "setup".into(),
+                        text_elements: vec![],
+                    },
+                ],
+                final_output_json_schema: None,
+            }],
+            "ops don't match {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_skill_slash_command_preserves_trailing_text() -> anyhow::Result<()> {
+        let skill = test_skill("design-skill");
+        let skill_path = skill.path.clone();
+        let (session_id, _client, thread, message_tx, local_set) =
+            setup_with_skills(vec![], vec![skill]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["/design-skill setup landing page".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
 
         let ops = thread.ops.lock().unwrap();
         assert_eq!(
             ops.as_slice(),
             &[Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: "Use the `teach-impeccable` skill for this request.".into(),
-                    text_elements: vec![]
-                }],
+                items: vec![
+                    UserInput::Skill {
+                        name: "design-skill".into(),
+                        path: skill_path,
+                    },
+                    UserInput::Text {
+                        text: "setup landing page".into(),
+                        text_elements: vec![],
+                    },
+                ],
                 final_output_json_schema: None,
             }],
             "ops don't match {ops:?}"
@@ -4949,7 +5010,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_exposes_user_skills_as_available_commands() -> anyhow::Result<()> {
         let (_session_id, client, _, message_tx, local_set) =
-            setup_with_skills(vec![], vec![test_skill("teach-impeccable")]).await?;
+            setup_with_skills(vec![], vec![test_skill("design-skill")]).await?;
         let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Load {
@@ -4981,7 +5042,7 @@ mod tests {
         assert!(
             available_commands
                 .iter()
-                .any(|command| command.name == "teach-impeccable"),
+                .any(|command| command.name == "design-skill"),
             "available commands don't include skill: {available_commands:?}"
         );
 
@@ -5141,8 +5202,9 @@ mod tests {
                     *self.active_prompt_id.lock().unwrap() = Some(id.to_string());
                     let prompt = items
                         .into_iter()
-                        .map(|i| match i {
-                            UserInput::Text { text, .. } => text,
+                        .filter_map(|i| match i {
+                            UserInput::Text { text, .. } => Some(text),
+                            UserInput::Skill { .. } => None,
                             _ => unimplemented!(),
                         })
                         .join("\n");
