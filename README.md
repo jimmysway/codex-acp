@@ -1,3 +1,35 @@
+# Codex ACP Fork
+
+This fork can be run in Zed as a custom ACP agent using a local build.
+
+Build either a debug or release binary first:
+
+```sh
+cargo build
+```
+
+This produces `target/debug/codex-acp`.
+
+```sh
+cargo build --release
+```
+
+This produces `target/release/codex-acp`.
+
+```json
+"Codex ACP Linux": {
+  "type": "custom",
+  "command": "bash",
+  "args": [
+    "-lc",
+    "RUST_LOG=info /path/to/codex-acp/target/debug/codex-acp 2>> /tmp/codex-acp.log"
+  ]
+}
+```
+
+Replace `/path/to/codex-acp` with the path to your local checkout, and switch `target/debug/codex-acp` to `target/release/codex-acp` if you built the release binary. The command appends logs to `/tmp/codex-acp.log`.
+
+
 # ACP adapter for Codex
 
 Use [Codex](https://github.com/openai/codex) from [ACP-compatible](https://agentclientprotocol.com) clients such as [Zed](https://zed.dev)!

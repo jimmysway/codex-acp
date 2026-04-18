@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    fs,
     ops::DerefMut,
     path::{Path, PathBuf},
     rc::Rc,
@@ -19,7 +20,7 @@ use agent_client_protocol::{
     SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
     TextContent, TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput,
-    UsageUpdate,
+    UsageUpdate, WriteTextFileRequest,
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
@@ -47,14 +48,15 @@ use codex_protocol::{
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
         FileChange, GuardianAssessmentEvent, GuardianAssessmentStatus, ItemCompletedEvent,
-        ItemStartedEvent, ListCustomPromptsResponseEvent, McpInvocation, McpStartupCompleteEvent,
-        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
-        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
-        PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
+        ItemStartedEvent, ListCustomPromptsResponseEvent, ListSkillsResponseEvent, McpInvocation,
+        McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent,
+        ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction, Op,
+        PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
+        ReviewTarget, RolloutItem, SandboxPolicy, SkillMetadata, SkillScope, StreamErrorEvent,
+        TerminalInteractionEvent, TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent,
+        TurnStartedEvent, UserMessageEvent, ViewImageToolCallEvent, WarningEvent,
+        WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
         PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
@@ -639,6 +641,8 @@ fn format_mcp_tool_approval_value(value: &serde_json::Value) -> String {
 enum SubmissionState {
     /// Loading custom prompts from the project
     CustomPrompts(CustomPromptsState),
+    /// Loading skills from the project and user skill roots.
+    Skills(SkillsState),
     /// User prompts, including slash commands like /init, /review, /compact, /undo.
     Prompt(PromptState),
 }
@@ -647,6 +651,7 @@ impl SubmissionState {
     fn is_active(&self) -> bool {
         match self {
             Self::CustomPrompts(state) => state.is_active(),
+            Self::Skills(state) => state.is_active(),
             Self::Prompt(state) => state.is_active(),
         }
     }
@@ -654,6 +659,7 @@ impl SubmissionState {
     async fn handle_event(&mut self, client: &SessionClient, event: EventMsg) {
         match self {
             Self::CustomPrompts(state) => state.handle_event(event),
+            Self::Skills(state) => state.handle_event(event),
             Self::Prompt(state) => state.handle_event(client, event).await,
         }
     }
@@ -666,6 +672,7 @@ impl SubmissionState {
     ) -> Result<(), Error> {
         match self {
             Self::CustomPrompts(..) => Ok(()),
+            Self::Skills(..) => Ok(()),
             Self::Prompt(state) => {
                 state
                     .handle_permission_request_resolved(client, request_key, response)
@@ -723,6 +730,38 @@ impl CustomPromptsState {
     }
 }
 
+struct SkillsState {
+    response_tx: Option<oneshot::Sender<Result<Vec<SkillMetadata>, Error>>>,
+}
+
+impl SkillsState {
+    fn new(response_tx: oneshot::Sender<Result<Vec<SkillMetadata>, Error>>) -> Self {
+        Self {
+            response_tx: Some(response_tx),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        let Some(response_tx) = &self.response_tx else {
+            return false;
+        };
+        !response_tx.is_closed()
+    }
+
+    fn handle_event(&mut self, event: EventMsg) {
+        match event {
+            EventMsg::ListSkillsResponse(ListSkillsResponseEvent { skills }) => {
+                if let Some(tx) = self.response_tx.take() {
+                    drop(tx.send(Ok(flatten_enabled_user_visible_skills(skills))));
+                }
+            }
+            e => {
+                warn!("Unexpected event: {e:?}");
+            }
+        }
+    }
+}
+
 struct ActiveCommand {
     tool_call_id: ToolCallId,
     terminal_output: bool,
@@ -735,9 +774,11 @@ struct PromptState {
     active_commands: HashMap<String, ActiveCommand>,
     active_web_search: Option<String>,
     active_guardian_assessments: HashSet<String>,
+    cwd: PathBuf,
     thread: Arc<dyn CodexThreadImpl>,
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     pending_permission_interactions: HashMap<String, PendingPermissionInteraction>,
+    pending_patch_replays: HashMap<String, PendingPatchReplay>,
     event_count: usize,
     response_tx: Option<oneshot::Sender<Result<StopReason, Error>>>,
     seen_message_deltas: bool,
@@ -747,6 +788,7 @@ struct PromptState {
 impl PromptState {
     fn new(
         submission_id: String,
+        cwd: PathBuf,
         thread: Arc<dyn CodexThreadImpl>,
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         response_tx: oneshot::Sender<Result<StopReason, Error>>,
@@ -756,9 +798,11 @@ impl PromptState {
             active_commands: HashMap::new(),
             active_web_search: None,
             active_guardian_assessments: HashSet::new(),
+            cwd,
             thread,
             resolution_tx,
             pending_permission_interactions: HashMap::new(),
+            pending_patch_replays: HashMap::new(),
             event_count: 0,
             response_tx: Some(response_tx),
             seen_message_deltas: false,
@@ -1515,7 +1559,7 @@ impl PromptState {
         Ok(())
     }
 
-    async fn start_patch_apply(&self, client: &SessionClient, event: PatchApplyBeginEvent) {
+    async fn start_patch_apply(&mut self, client: &SessionClient, event: PatchApplyBeginEvent) {
         let raw_input = serde_json::json!(&event);
         let PatchApplyBeginEvent {
             call_id,
@@ -1523,6 +1567,11 @@ impl PromptState {
             changes,
             turn_id: _,
         } = event;
+
+        self.pending_patch_replays.insert(
+            call_id.clone(),
+            PendingPatchReplay::capture(&self.cwd, &changes),
+        );
 
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
 
@@ -1538,7 +1587,7 @@ impl PromptState {
             .await;
     }
 
-    async fn end_patch_apply(&self, client: &SessionClient, event: PatchApplyEndEvent) {
+    async fn end_patch_apply(&mut self, client: &SessionClient, event: PatchApplyEndEvent) {
         let raw_output = serde_json::json!(&event);
         let PatchApplyEndEvent {
             call_id,
@@ -1561,6 +1610,51 @@ impl PromptState {
             PatchApplyStatus::Completed => ToolCallStatus::Completed,
             _ if success => ToolCallStatus::Completed,
             PatchApplyStatus::Failed | PatchApplyStatus::Declined => ToolCallStatus::Failed,
+        };
+
+        let (replay_error, replay_skipped_paths) = if matches!(status, ToolCallStatus::Completed) {
+            if let Some(pending_replay) = self.pending_patch_replays.remove(&call_id) {
+                let replay_skipped_paths = pending_replay
+                    .skipped_paths()
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>();
+                (
+                    pending_replay.replay(client).await.err(),
+                    replay_skipped_paths,
+                )
+            } else {
+                (None, Vec::new())
+            }
+        } else {
+            self.pending_patch_replays.remove(&call_id);
+            (None, Vec::new())
+        };
+
+        let raw_output = {
+            let mut raw_output = raw_output.clone();
+            if let Some(replay_error) = replay_error {
+                if let Some(object) = raw_output.as_object_mut() {
+                    object.insert(
+                        "acpReplayError".to_string(),
+                        serde_json::Value::String(replay_error),
+                    );
+                }
+            }
+            if let Some(object) = raw_output.as_object_mut() {
+                if !replay_skipped_paths.is_empty() {
+                    object.insert(
+                        "acpReplaySkippedPaths".to_string(),
+                        serde_json::Value::Array(
+                            replay_skipped_paths
+                                .into_iter()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                }
+            }
+            raw_output
         };
 
         client
@@ -2555,6 +2649,155 @@ impl SessionClient {
             ))
             .await
     }
+
+    fn supports_write_text_file(&self) -> bool {
+        self.client_capabilities.lock().unwrap().fs.write_text_file
+    }
+
+    async fn write_text_file(
+        &self,
+        path: impl Into<PathBuf>,
+        content: impl Into<String>,
+    ) -> Result<(), Error> {
+        self.client
+            .write_text_file(WriteTextFileRequest::new(
+                self.session_id.clone(),
+                path.into(),
+                content.into(),
+            ))
+            .await
+            .map(|_| ())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingPatchReplay {
+    files: Vec<PendingPatchReplayFile>,
+    skipped_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPatchReplayFile {
+    path: PathBuf,
+    original_content: Option<String>,
+}
+
+impl PendingPatchReplay {
+    fn capture(cwd: &Path, changes: &HashMap<PathBuf, FileChange>) -> Self {
+        let mut files = Vec::new();
+        let mut skipped_paths = Vec::new();
+
+        for (path, change) in changes {
+            match PendingPatchReplayFile::capture(cwd, path, change) {
+                Some(file) => files.push(file),
+                None => skipped_paths.push(absolutize_patch_path(cwd, path)),
+            }
+        }
+
+        Self {
+            files,
+            skipped_paths,
+        }
+    }
+
+    async fn replay(self, client: &SessionClient) -> Result<(), String> {
+        if !client.supports_write_text_file() {
+            return Ok(());
+        }
+
+        for file in self.files {
+            let new_content = fs::read_to_string(&file.path).map_err(|err| {
+                format!(
+                    "failed to read post-patch content for {}: {err}",
+                    file.path.display()
+                )
+            })?;
+
+            if let Some(original_content) = &file.original_content {
+                fs::write(&file.path, original_content).map_err(|err| {
+                    format!(
+                        "failed to restore original content for {}: {err}",
+                        file.path.display()
+                    )
+                })?;
+            } else if file.path.exists() {
+                fs::remove_file(&file.path).map_err(|err| {
+                    format!(
+                        "failed to remove newly created file {}: {err}",
+                        file.path.display()
+                    )
+                })?;
+            }
+
+            if let Err(err) = client
+                .write_text_file(file.path.clone(), new_content.clone())
+                .await
+            {
+                let restore_result = if let Some(parent) = file.path.parent() {
+                    fs::create_dir_all(parent).and_then(|_| fs::write(&file.path, &new_content))
+                } else {
+                    fs::write(&file.path, &new_content)
+                };
+                if restore_result.is_err() {
+                    return Err(format!(
+                        "ACP replay failed for {} and restoring the patch content also failed: {err:?}",
+                        file.path.display()
+                    ));
+                }
+                return Err(format!(
+                    "ACP replay failed for {}: {err:?}",
+                    file.path.display()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn skipped_paths(&self) -> &[PathBuf] {
+        &self.skipped_paths
+    }
+}
+
+impl PendingPatchReplayFile {
+    fn capture(cwd: &Path, path: &Path, change: &FileChange) -> Option<Self> {
+        let path = absolutize_patch_path(cwd, path);
+        if !path_is_within_root(&path, cwd) {
+            return None;
+        }
+
+        match change {
+            FileChange::Add { .. } => Some(Self {
+                path,
+                original_content: None,
+            }),
+            FileChange::Update {
+                move_path: None, ..
+            } => {
+                let original_content = fs::read_to_string(&path).ok()?;
+                Some(Self {
+                    path,
+                    original_content: Some(original_content),
+                })
+            }
+            FileChange::Delete { .. }
+            | FileChange::Update {
+                move_path: Some(_), ..
+            } => None,
+        }
+    }
+}
+
+fn absolutize_patch_path(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn path_is_within_root(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 struct ThreadActor<A> {
@@ -2568,6 +2811,8 @@ struct ThreadActor<A> {
     config: Config,
     /// The custom prompts loaded for this workspace.
     custom_prompts: Rc<RefCell<Vec<CustomPrompt>>>,
+    /// The enabled user-visible skills loaded for this workspace.
+    skills: Rc<RefCell<Vec<SkillMetadata>>>,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
     /// Internal message sender used to route spawned interaction results back to the actor.
@@ -2600,6 +2845,7 @@ impl<A: Auth> ThreadActor<A> {
             thread,
             config,
             custom_prompts: Rc::default(),
+            skills: Rc::default(),
             models_manager,
             resolution_tx,
             submissions: HashMap::new(),
@@ -2647,7 +2893,9 @@ impl<A: Auth> ThreadActor<A> {
                 let client = self.client.clone();
                 let mut available_commands = Self::builtin_commands();
                 let load_custom_prompts = self.load_custom_prompts().await;
+                let load_skills = self.load_skills().await;
                 let custom_prompts = self.custom_prompts.clone();
+                let skills = self.skills.clone();
 
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
@@ -2657,6 +2905,12 @@ impl<A: Auth> ThreadActor<A> {
                         .map_err(|_| Error::internal_error())
                         .flatten()
                         .inspect_err(|e| error!("Failed to load custom prompts {e:?}"))
+                        .unwrap_or_default();
+                    let mut new_skills = load_skills
+                        .await
+                        .map_err(|_| Error::internal_error())
+                        .flatten()
+                        .inspect_err(|e| error!("Failed to load skills {e:?}"))
                         .unwrap_or_default();
 
                     for prompt in &new_custom_prompts {
@@ -2674,10 +2928,17 @@ impl<A: Auth> ThreadActor<A> {
                             )),
                         );
                     }
+                    for skill in &new_skills {
+                        available_commands.push(AvailableCommand::new(
+                            skill.name.clone(),
+                            skill.description.clone(),
+                        ));
+                    }
                     std::mem::swap(
                         custom_prompts.borrow_mut().deref_mut(),
                         &mut new_custom_prompts,
                     );
+                    std::mem::swap(skills.borrow_mut().deref_mut(), &mut new_skills);
 
                     client
                         .send_notification(SessionUpdate::AvailableCommandsUpdate(
@@ -2800,6 +3061,31 @@ impl<A: Auth> ThreadActor<A> {
         self.submissions.insert(
             submission_id,
             SubmissionState::CustomPrompts(CustomPromptsState::new(response_tx)),
+        );
+
+        response_rx
+    }
+
+    async fn load_skills(&mut self) -> oneshot::Receiver<Result<Vec<SkillMetadata>, Error>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let submission_id = match self
+            .thread
+            .submit(Op::ListSkills {
+                cwds: Vec::new(),
+                force_reload: true,
+            })
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                drop(response_tx.send(Err(Error::internal_error().data(e.to_string()))));
+                return response_rx;
+            }
+        };
+
+        self.submissions.insert(
+            submission_id,
+            SubmissionState::Skills(SkillsState::new(response_tx)),
         );
 
         response_rx
@@ -3221,6 +3507,14 @@ impl<A: Auth> ThreadActor<A> {
                             }],
                             final_output_json_schema: None,
                         }
+                    } else if self.skills.borrow().iter().any(|skill| skill.name == name) {
+                        op = Op::UserInput {
+                            items: vec![UserInput::Text {
+                                text: skill_command_prompt(name, rest),
+                                text_elements: vec![],
+                            }],
+                            final_output_json_schema: None,
+                        }
                     } else {
                         op = Op::UserInput {
                             items,
@@ -3247,6 +3541,7 @@ impl<A: Auth> ThreadActor<A> {
 
         let state = SubmissionState::Prompt(PromptState::new(
             submission_id.clone(),
+            self.config.cwd.clone().into(),
             self.thread.clone(),
             self.resolution_tx.clone(),
             response_tx,
@@ -4044,14 +4339,42 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     parse_slash_name(line)
 }
 
+fn flatten_enabled_user_visible_skills(
+    entries: Vec<codex_protocol::protocol::SkillsListEntry>,
+) -> Vec<SkillMetadata> {
+    let mut deduped = HashMap::new();
+    for entry in entries {
+        for skill in entry.skills {
+            if skill.enabled && matches!(skill.scope, SkillScope::User | SkillScope::Repo) {
+                deduped.entry(skill.name.clone()).or_insert(skill);
+            }
+        }
+    }
+
+    let mut skills = deduped.into_values().collect::<Vec<_>>();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
+fn skill_command_prompt(name: &str, rest: &str) -> String {
+    if rest.trim().is_empty() {
+        format!("Use the `{name}` skill for this request.")
+    } else {
+        format!("Use the `{name}` skill for this request.\n\nArguments or mode: {rest}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use agent_client_protocol::{RequestPermissionResponse, TextContent};
+    use agent_client_protocol::{
+        ClientCapabilities, FileSystemCapabilities, RequestPermissionResponse, TextContent,
+    };
     use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
     use codex_protocol::config_types::ModeKind;
     use tokio::{
@@ -4060,6 +4383,35 @@ mod tests {
     };
 
     use super::*;
+
+    fn test_session_client(client: Arc<StubClient>, write_text_file: bool) -> SessionClient {
+        let capabilities = ClientCapabilities::new()
+            .fs(FileSystemCapabilities::new().write_text_file(write_text_file));
+        SessionClient::with_client(
+            SessionId::new("test"),
+            client,
+            Arc::new(std::sync::Mutex::new(capabilities)),
+        )
+    }
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("codex-acp-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn test_skill(name: &str) -> SkillMetadata {
+        SkillMetadata {
+            name: name.to_string(),
+            description: format!("Skill {name}"),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            path: PathBuf::from(format!("/tmp/{name}/SKILL.md")),
+            scope: SkillScope::User,
+            enabled: true,
+        }
+    }
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
@@ -4517,6 +4869,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_skill_slash_command_expands_to_user_prompt() -> anyhow::Result<()> {
+        let skill = test_skill("teach-impeccable");
+        let (session_id, client, thread, message_tx, local_set) =
+            setup_with_skills(vec![], vec![skill]).await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(session_id.clone(), vec!["/teach-impeccable".into()]),
+            response_tx: prompt_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let stop_reason = prompt_response_rx.await??.await??;
+                assert_eq!(stop_reason, StopReason::EndTurn);
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        assert!(matches!(
+            &notifications[0].update,
+            SessionUpdate::AgentMessageChunk(ContentChunk {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) if text == "Use the `teach-impeccable` skill for this request."
+        ));
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "Use the `teach-impeccable` skill for this request.".into(),
+                    text_elements: vec![]
+                }],
+                final_output_json_schema: None,
+            }],
+            "ops don't match {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_load_exposes_user_skills_as_available_commands() -> anyhow::Result<()> {
+        let (_session_id, client, _, message_tx, local_set) =
+            setup_with_skills(vec![], vec![test_skill("teach-impeccable")]).await?;
+        let (load_response_tx, load_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Load {
+            response_tx: load_response_tx,
+        })?;
+
+        tokio::try_join!(
+            async {
+                let _response = load_response_rx.await??;
+                drop(message_tx);
+                anyhow::Ok(())
+            },
+            async {
+                local_set.await;
+                anyhow::Ok(())
+            }
+        )?;
+
+        let notifications = client.notifications.lock().unwrap();
+        let available_commands = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::AvailableCommandsUpdate(update) => {
+                    Some(update.available_commands.clone())
+                }
+                _ => None,
+            });
+        let available_commands = available_commands.expect("missing available commands update");
+        assert!(
+            available_commands
+                .iter()
+                .any(|command| command.name == "teach-impeccable"),
+            "available commands don't include skill: {available_commands:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_delta_deduplication() -> anyhow::Result<()> {
         let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
@@ -4566,11 +5010,24 @@ mod tests {
         UnboundedSender<ThreadMessage>,
         LocalSet,
     )> {
+        setup_with_skills(custom_prompts, vec![]).await
+    }
+
+    async fn setup_with_skills(
+        custom_prompts: Vec<CustomPrompt>,
+        skills: Vec<SkillMetadata>,
+    ) -> anyhow::Result<(
+        SessionId,
+        Arc<StubClient>,
+        Arc<StubCodexThread>,
+        UnboundedSender<ThreadMessage>,
+        LocalSet,
+    )> {
         let session_id = SessionId::new("test");
         let client = Arc::new(StubClient::new());
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
-        let conversation = Arc::new(StubCodexThread::new());
+        let conversation = Arc::new(StubCodexThread::new(skills.clone()));
         let models_manager = Arc::new(StubModelsManager);
         let config = Config::load_with_cli_overrides_and_harness_overrides(
             vec![],
@@ -4591,6 +5048,7 @@ mod tests {
             resolution_rx,
         );
         actor.custom_prompts = Rc::new(RefCell::new(custom_prompts));
+        actor.skills = Rc::new(RefCell::new(skills));
 
         let local_set = LocalSet::new();
         local_set.spawn_local(actor.spawn());
@@ -4622,17 +5080,19 @@ mod tests {
         current_id: AtomicUsize,
         active_prompt_id: std::sync::Mutex<Option<String>>,
         ops: std::sync::Mutex<Vec<Op>>,
+        skills: Vec<SkillMetadata>,
         op_tx: mpsc::UnboundedSender<Event>,
         op_rx: Mutex<mpsc::UnboundedReceiver<Event>>,
     }
 
     impl StubCodexThread {
-        fn new() -> Self {
+        fn new(skills: Vec<SkillMetadata>) -> Self {
             let (op_tx, op_rx) = mpsc::unbounded_channel();
             StubCodexThread {
                 current_id: AtomicUsize::new(0),
                 active_prompt_id: std::sync::Mutex::default(),
                 ops: std::sync::Mutex::default(),
+                skills,
                 op_tx,
                 op_rx: Mutex::new(op_rx),
             }
@@ -4891,6 +5351,32 @@ mod tests {
                         })
                         .unwrap();
                 }
+                Op::ListCustomPrompts => {
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::ListCustomPromptsResponse(
+                                ListCustomPromptsResponseEvent {
+                                    custom_prompts: vec![],
+                                },
+                            ),
+                        })
+                        .unwrap();
+                }
+                Op::ListSkills { .. } => {
+                    self.op_tx
+                        .send(Event {
+                            id: id.to_string(),
+                            msg: EventMsg::ListSkillsResponse(ListSkillsResponseEvent {
+                                skills: vec![codex_protocol::protocol::SkillsListEntry {
+                                    cwd: std::env::current_dir().unwrap(),
+                                    skills: self.skills.clone(),
+                                    errors: vec![],
+                                }],
+                            }),
+                        })
+                        .unwrap();
+                }
                 Op::ExecApproval { .. }
                 | Op::ResolveElicitation { .. }
                 | Op::RequestPermissionsResponse { .. }
@@ -4928,6 +5414,7 @@ mod tests {
         notifications: std::sync::Mutex<Vec<SessionNotification>>,
         permission_requests: std::sync::Mutex<Vec<RequestPermissionRequest>>,
         permission_responses: std::sync::Mutex<VecDeque<RequestPermissionResponse>>,
+        write_text_file_requests: std::sync::Mutex<Vec<WriteTextFileRequest>>,
         block_permission_requests: Option<Arc<Notify>>,
     }
 
@@ -4937,6 +5424,7 @@ mod tests {
                 notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::default(),
+                write_text_file_requests: std::sync::Mutex::default(),
                 block_permission_requests: None,
             }
         }
@@ -4946,6 +5434,7 @@ mod tests {
                 notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
+                write_text_file_requests: std::sync::Mutex::default(),
                 block_permission_requests: None,
             }
         }
@@ -4958,6 +5447,7 @@ mod tests {
                 notifications: std::sync::Mutex::default(),
                 permission_requests: std::sync::Mutex::default(),
                 permission_responses: std::sync::Mutex::new(responses.into()),
+                write_text_file_requests: std::sync::Mutex::default(),
                 block_permission_requests: Some(notify),
             }
         }
@@ -4986,6 +5476,14 @@ mod tests {
         async fn session_notification(&self, args: SessionNotification) -> Result<(), Error> {
             self.notifications.lock().unwrap().push(args);
             Ok(())
+        }
+
+        async fn write_text_file(
+            &self,
+            args: WriteTextFileRequest,
+        ) -> Result<agent_client_protocol::WriteTextFileResponse, Error> {
+            self.write_text_file_requests.lock().unwrap().push(args);
+            Ok(agent_client_protocol::WriteTextFileResponse::new())
         }
     }
 
@@ -5070,6 +5568,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pending_patch_replay_routes_update_through_acp_write_text_file()
+    -> anyhow::Result<()> {
+        let temp_dir = test_temp_dir("replay-update");
+        let file_path = temp_dir.join("file.txt");
+        fs::write(&file_path, "old\n")?;
+
+        let pending = PendingPatchReplay::capture(
+            &temp_dir,
+            &HashMap::from([(
+                file_path.clone(),
+                FileChange::Update {
+                    unified_diff: String::new(),
+                    move_path: None,
+                },
+            )]),
+        );
+
+        fs::write(&file_path, "new\n")?;
+
+        let client = Arc::new(StubClient::new());
+        let session_client = test_session_client(client.clone(), true);
+        pending
+            .replay(&session_client)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(fs::read_to_string(&file_path)?, "old\n");
+        let requests = client.write_text_file_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, file_path);
+        assert_eq!(requests[0].content, "new\n");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_patch_replay_routes_add_through_acp_write_text_file() -> anyhow::Result<()>
+    {
+        let temp_dir = test_temp_dir("replay-add");
+        let file_path = temp_dir.join("new.txt");
+
+        let pending = PendingPatchReplay::capture(
+            &temp_dir,
+            &HashMap::from([(
+                file_path.clone(),
+                FileChange::Add {
+                    content: "new file\n".to_string(),
+                },
+            )]),
+        );
+
+        fs::write(&file_path, "new file\n")?;
+
+        let client = Arc::new(StubClient::new());
+        let session_client = test_session_client(client.clone(), true);
+        pending
+            .replay(&session_client)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        assert!(
+            !file_path.exists(),
+            "new file should be reverted before ACP replay"
+        );
+        let requests = client.write_text_file_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].path, file_path);
+        assert_eq!(requests[0].content, "new file\n");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_patch_replay_noops_without_fs_write_capability() -> anyhow::Result<()> {
+        let temp_dir = test_temp_dir("replay-no-fs");
+        let file_path = temp_dir.join("file.txt");
+        fs::write(&file_path, "old\n")?;
+
+        let pending = PendingPatchReplay::capture(
+            &temp_dir,
+            &HashMap::from([(
+                file_path.clone(),
+                FileChange::Update {
+                    unified_diff: String::new(),
+                    move_path: None,
+                },
+            )]),
+        );
+
+        fs::write(&file_path, "new\n")?;
+
+        let client = Arc::new(StubClient::new());
+        let session_client = test_session_client(client.clone(), false);
+        pending
+            .replay(&session_client)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(fs::read_to_string(&file_path)?, "new\n");
+        assert!(client.write_text_file_requests.lock().unwrap().is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_patch_replay_skips_files_outside_session_root() -> anyhow::Result<()> {
+        let temp_dir = test_temp_dir("replay-root");
+        let outside_dir = test_temp_dir("replay-outside");
+        let outside_path = outside_dir.join("outside.txt");
+        fs::write(&outside_path, "old\n")?;
+
+        let pending = PendingPatchReplay::capture(
+            &temp_dir,
+            &HashMap::from([(
+                outside_path.clone(),
+                FileChange::Update {
+                    unified_diff: String::new(),
+                    move_path: None,
+                },
+            )]),
+        );
+
+        fs::write(&outside_path, "new\n")?;
+
+        let client = Arc::new(StubClient::new());
+        let session_client = test_session_client(client.clone(), true);
+        pending
+            .replay(&session_client)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(fs::read_to_string(&outside_path)?, "new\n");
+        assert!(client.write_text_file_requests.lock().unwrap().is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_patch_replay_skips_delete_operations() -> anyhow::Result<()> {
+        let temp_dir = test_temp_dir("replay-delete");
+        let file_path = temp_dir.join("deleted.txt");
+
+        let pending = PendingPatchReplay::capture(
+            &temp_dir,
+            &HashMap::from([(
+                file_path.clone(),
+                FileChange::Delete {
+                    content: "old\n".to_string(),
+                },
+            )]),
+        );
+
+        assert!(pending.files.is_empty());
+        assert_eq!(pending.skipped_paths(), &[file_path]);
+
+        let client = Arc::new(StubClient::new());
+        let session_client = test_session_client(client.clone(), true);
+        pending
+            .replay(&session_client)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(client.write_text_file_requests.lock().unwrap().is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_patch_replay_skips_move_operations() -> anyhow::Result<()> {
+        let temp_dir = test_temp_dir("replay-move");
+        let source_path = temp_dir.join("source.txt");
+
+        let pending = PendingPatchReplay::capture(
+            &temp_dir,
+            &HashMap::from([(
+                source_path.clone(),
+                FileChange::Update {
+                    unified_diff: String::new(),
+                    move_path: Some(temp_dir.join("dest.txt")),
+                },
+            )]),
+        );
+
+        assert!(pending.files.is_empty());
+        assert_eq!(pending.skipped_paths(), &[source_path]);
+
+        let client = Arc::new(StubClient::new());
+        let session_client = test_session_client(client.clone(), true);
+        pending
+            .replay(&session_client)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        assert!(client.write_text_file_requests.lock().unwrap().is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_exec_approval_uses_available_decisions() -> anyhow::Result<()> {
         LocalSet::new()
             .run_until(async {
@@ -5081,11 +5776,12 @@ mod tests {
                 ]));
                 let session_client =
                     SessionClient::with_client(session_id, client.clone(), Arc::default());
-                let thread = Arc::new(StubCodexThread::new());
+                let thread = Arc::new(StubCodexThread::new(vec![]));
                 let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
                 let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut prompt_state = PromptState::new(
                     "submission-id".to_string(),
+                    PathBuf::new(),
                     thread.clone(),
                     message_tx,
                     response_tx,
@@ -5169,11 +5865,12 @@ mod tests {
                 ]));
                 let session_client =
                     SessionClient::with_client(session_id, client.clone(), Arc::default());
-                let thread = Arc::new(StubCodexThread::new());
+                let thread = Arc::new(StubCodexThread::new(vec![]));
                 let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
                 let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut prompt_state = PromptState::new(
                     "submission-id".to_string(),
+                    PathBuf::new(),
                     thread.clone(),
                     message_tx,
                     response_tx,
@@ -5287,11 +5984,12 @@ mod tests {
                 ]));
                 let session_client =
                     SessionClient::with_client(session_id, client.clone(), Arc::default());
-                let thread = Arc::new(StubCodexThread::new());
+                let thread = Arc::new(StubCodexThread::new(vec![]));
                 let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
                 let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut prompt_state = PromptState::new(
                     "submission-id".to_string(),
+                    PathBuf::new(),
                     thread.clone(),
                     message_tx,
                     response_tx,
@@ -5354,11 +6052,16 @@ mod tests {
                 ));
                 let session_client =
                     SessionClient::with_client(session_id, client.clone(), Arc::default());
-                let thread = Arc::new(StubCodexThread::new());
+                let thread = Arc::new(StubCodexThread::new(vec![]));
                 let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
                 let (message_tx, _message_rx) = tokio::sync::mpsc::unbounded_channel();
-                let mut prompt_state =
-                    PromptState::new("submission-id".to_string(), thread, message_tx, response_tx);
+                let mut prompt_state = PromptState::new(
+                    "submission-id".to_string(),
+                    PathBuf::new(),
+                    thread,
+                    message_tx,
+                    response_tx,
+                );
 
                 prompt_state
                     .handle_event(
@@ -5429,7 +6132,7 @@ mod tests {
         ));
         let session_client =
             SessionClient::with_client(session_id.clone(), client.clone(), Arc::default());
-        let conversation = Arc::new(StubCodexThread::new());
+        let conversation = Arc::new(StubCodexThread::new(vec![]));
         let models_manager = Arc::new(StubModelsManager);
         let config = Config::load_with_cli_overrides_and_harness_overrides(
             vec![],
