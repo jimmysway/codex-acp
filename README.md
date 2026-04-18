@@ -17,7 +17,7 @@ cargo build --release
 This produces `target/release/codex-acp`.
 
 ```json
-"Codex ACP Linux": {
+"Codex ACP Custom": {
   "type": "custom",
   "command": "bash",
   "args": [
@@ -28,6 +28,8 @@ This produces `target/release/codex-acp`.
 ```
 
 Replace `/path/to/codex-acp` with the path to your local checkout, and switch `target/debug/codex-acp` to `target/release/codex-acp` if you built the release binary. The command appends logs to `/tmp/codex-acp.log`.
+
+After a restart of Zed you should see `Codex ACP Custom` or whatever name you set as an option in the **External Agents** menu in Zed
 
 
 # ACP adapter for Codex
