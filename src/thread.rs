@@ -2797,14 +2797,14 @@ fn absolutize_patch_path(cwd: &Path, path: &Path) -> PathBuf {
 }
 
 fn path_is_within_root(path: &Path, root: &Path) -> bool {
-    let Some(normalized_path) = normalize_path_for_root_check(path) else {
+    let Some(resolved_path) = resolve_path_for_root_check(path) else {
         return false;
     };
-    let Some(normalized_root) = normalize_path_for_root_check(root) else {
+    let Ok(resolved_root) = fs::canonicalize(root) else {
         return false;
     };
 
-    normalized_path == normalized_root || normalized_path.starts_with(&normalized_root)
+    resolved_path == resolved_root || resolved_path.starts_with(&resolved_root)
 }
 
 fn normalize_path_for_root_check(path: &Path) -> Option<PathBuf> {
@@ -2826,6 +2826,25 @@ fn normalize_path_for_root_check(path: &Path) -> Option<PathBuf> {
     }
 
     Some(normalized)
+}
+
+fn resolve_path_for_root_check(path: &Path) -> Option<PathBuf> {
+    let normalized = normalize_path_for_root_check(path)?;
+    let mut existing_ancestor = normalized.as_path();
+    let mut missing_components = Vec::new();
+
+    while fs::symlink_metadata(existing_ancestor).is_err() {
+        let name = existing_ancestor.file_name()?.to_os_string();
+        missing_components.push(name);
+        existing_ancestor = existing_ancestor.parent()?;
+    }
+
+    let mut resolved = fs::canonicalize(existing_ancestor).ok()?;
+    for component in missing_components.into_iter().rev() {
+        resolved.push(component);
+    }
+
+    Some(resolved)
 }
 
 struct ThreadActor<A> {
@@ -4440,6 +4459,16 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(src, dst)
+    }
+
+    #[cfg(windows)]
+    fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(src, dst)
+    }
+
     fn test_skill(name: &str) -> SkillMetadata {
         SkillMetadata {
             name: name.to_string(),
@@ -5826,6 +5855,50 @@ mod tests {
                 .join("../")
                 .join(outside_dir.file_name().unwrap())
                 .join("outside.txt")]
+        );
+
+        fs::write(&outside_path, "new\n")?;
+
+        let client = Arc::new(StubClient::new());
+        let session_client = test_session_client(client.clone(), true);
+        pending
+            .replay(&session_client)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(fs::read_to_string(&outside_path)?, "new\n");
+        assert!(client.write_text_file_requests.lock().unwrap().is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_patch_replay_skips_paths_through_symlinks_that_escape_session_root()
+    -> anyhow::Result<()> {
+        let temp_dir = test_temp_dir("replay-symlink-root");
+        let outside_dir = test_temp_dir("replay-symlink-outside");
+        let outside_path = outside_dir.join("outside.txt");
+        fs::write(&outside_path, "old\n")?;
+
+        let link_path = temp_dir.join("link");
+        create_dir_symlink(&outside_dir, &link_path)?;
+
+        let escaped_path = PathBuf::from("link/outside.txt");
+        let pending = PendingPatchReplay::capture(
+            &temp_dir,
+            &HashMap::from([(
+                escaped_path,
+                FileChange::Update {
+                    unified_diff: String::new(),
+                    move_path: None,
+                },
+            )]),
+        );
+
+        assert!(pending.files.is_empty());
+        assert_eq!(
+            pending.skipped_paths(),
+            &[temp_dir.join("link/outside.txt")]
         );
 
         fs::write(&outside_path, "new\n")?;
