@@ -1612,24 +1612,42 @@ impl PromptState {
             PatchApplyStatus::Failed | PatchApplyStatus::Declined => ToolCallStatus::Failed,
         };
 
-        let (replay_error, replay_skipped_paths) = if matches!(status, ToolCallStatus::Completed) {
-            if let Some(pending_replay) = self.pending_patch_replays.remove(&call_id) {
-                let replay_skipped_paths = pending_replay
-                    .skipped_paths()
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>();
-                (
-                    pending_replay.replay(client).await.err(),
-                    replay_skipped_paths,
-                )
+        let (replay_error, replay_skipped, replay_skipped_paths) =
+            if matches!(status, ToolCallStatus::Completed) {
+                if let Some(pending_replay) = self.pending_patch_replays.remove(&call_id) {
+                    let mut replay_skipped = pending_replay
+                        .skipped_paths()
+                        .iter()
+                        .map(|path| PendingPatchReplaySkip {
+                            path: path.clone(),
+                            reason: "replay capture skipped this path".to_string(),
+                        })
+                        .collect::<Vec<_>>();
+
+                    match pending_replay.replay(client).await {
+                        Ok(dynamic_skips) => {
+                            replay_skipped.extend(dynamic_skips);
+                            let replay_skipped_paths = replay_skipped
+                                .iter()
+                                .map(|skip| skip.path.display().to_string())
+                                .collect::<Vec<_>>();
+                            (None, replay_skipped, replay_skipped_paths)
+                        }
+                        Err(err) => {
+                            let replay_skipped_paths = replay_skipped
+                                .iter()
+                                .map(|skip| skip.path.display().to_string())
+                                .collect::<Vec<_>>();
+                            (Some(err), replay_skipped, replay_skipped_paths)
+                        }
+                    }
+                } else {
+                    (None, Vec::new(), Vec::new())
+                }
             } else {
-                (None, Vec::new())
-            }
-        } else {
-            self.pending_patch_replays.remove(&call_id);
-            (None, Vec::new())
-        };
+                self.pending_patch_replays.remove(&call_id);
+                (None, Vec::new(), Vec::new())
+            };
 
         let raw_output = {
             let mut raw_output = raw_output.clone();
@@ -1642,6 +1660,22 @@ impl PromptState {
                 }
             }
             if let Some(object) = raw_output.as_object_mut() {
+                if !replay_skipped.is_empty() {
+                    object.insert(
+                        "acpReplaySkipped".to_string(),
+                        serde_json::Value::Array(
+                            replay_skipped
+                                .into_iter()
+                                .map(|skip| {
+                                    serde_json::json!({
+                                        "path": skip.path.display().to_string(),
+                                        "reason": skip.reason,
+                                    })
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
                 if !replay_skipped_paths.is_empty() {
                     object.insert(
                         "acpReplaySkippedPaths".to_string(),
@@ -2679,7 +2713,13 @@ struct PendingPatchReplay {
 #[derive(Debug, Clone)]
 struct PendingPatchReplayFile {
     path: PathBuf,
-    original_content: Option<String>,
+    expected_content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPatchReplaySkip {
+    path: PathBuf,
+    reason: String,
 }
 
 impl PendingPatchReplay {
@@ -2700,50 +2740,43 @@ impl PendingPatchReplay {
         }
     }
 
-    async fn replay(self, client: &SessionClient) -> Result<(), String> {
+    async fn replay(self, client: &SessionClient) -> Result<Vec<PendingPatchReplaySkip>, String> {
         if !client.supports_write_text_file() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
+        let mut skipped = Vec::new();
         for file in self.files {
-            let new_content = fs::read_to_string(&file.path).map_err(|err| {
-                format!(
-                    "failed to read post-patch content for {}: {err}",
-                    file.path.display()
-                )
-            })?;
-
-            if let Some(original_content) = &file.original_content {
-                fs::write(&file.path, original_content).map_err(|err| {
-                    format!(
-                        "failed to restore original content for {}: {err}",
-                        file.path.display()
-                    )
-                })?;
-            } else if file.path.exists() {
-                fs::remove_file(&file.path).map_err(|err| {
-                    format!(
-                        "failed to remove newly created file {}: {err}",
-                        file.path.display()
-                    )
-                })?;
-            }
-
-            if let Err(err) = client
-                .write_text_file(file.path.clone(), new_content.clone())
-                .await
-            {
-                let restore_result = if let Some(parent) = file.path.parent() {
-                    fs::create_dir_all(parent).and_then(|_| fs::write(&file.path, &new_content))
-                } else {
-                    fs::write(&file.path, &new_content)
-                };
-                if restore_result.is_err() {
+            let current_content = match fs::read_to_string(&file.path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    skipped.push(PendingPatchReplaySkip {
+                        path: file.path.clone(),
+                        reason: "file changed again after patch apply; ACP replay skipped"
+                            .to_string(),
+                    });
+                    continue;
+                }
+                Err(err) => {
                     return Err(format!(
-                        "ACP replay failed for {} and restoring the patch content also failed: {err:?}",
+                        "failed to read post-patch content for {}: {err}",
                         file.path.display()
                     ));
                 }
+            };
+
+            if current_content != file.expected_content {
+                skipped.push(PendingPatchReplaySkip {
+                    path: file.path.clone(),
+                    reason: "file changed again after patch apply; ACP replay skipped".to_string(),
+                });
+                continue;
+            }
+
+            if let Err(err) = client
+                .write_text_file(file.path.clone(), current_content.clone())
+                .await
+            {
                 return Err(format!(
                     "ACP replay failed for {}: {err:?}",
                     file.path.display()
@@ -2751,7 +2784,7 @@ impl PendingPatchReplay {
             }
         }
 
-        Ok(())
+        Ok(skipped)
     }
 
     fn skipped_paths(&self) -> &[PathBuf] {
@@ -2767,17 +2800,19 @@ impl PendingPatchReplayFile {
         }
 
         match change {
-            FileChange::Add { .. } => Some(Self {
+            FileChange::Add { content } => Some(Self {
                 path,
-                original_content: None,
+                expected_content: content.clone(),
             }),
             FileChange::Update {
-                move_path: None, ..
+                unified_diff,
+                move_path: None,
             } => {
                 let original_content = fs::read_to_string(&path).ok()?;
+                let expected_content = apply_unified_diff(&original_content, unified_diff).ok()?;
                 Some(Self {
                     path,
-                    original_content: Some(original_content),
+                    expected_content,
                 })
             }
             FileChange::Delete { .. }
@@ -2786,6 +2821,13 @@ impl PendingPatchReplayFile {
             } => None,
         }
     }
+}
+
+fn apply_unified_diff(original_content: &str, unified_diff: &str) -> Result<String, String> {
+    let patch = diffy::Patch::from_str(unified_diff)
+        .map_err(|err| format!("failed to parse unified diff: {err}"))?;
+    diffy::apply(original_content, &patch)
+        .map_err(|err| format!("failed to apply unified diff: {err}"))
 }
 
 fn absolutize_patch_path(cwd: &Path, path: &Path) -> PathBuf {
@@ -5692,13 +5734,14 @@ mod tests {
         let temp_dir = test_temp_dir("replay-update");
         let file_path = temp_dir.join("file.txt");
         fs::write(&file_path, "old\n")?;
+        let unified_diff = diffy::create_patch("old\n", "new\n").to_string();
 
         let pending = PendingPatchReplay::capture(
             &temp_dir,
             &HashMap::from([(
                 file_path.clone(),
                 FileChange::Update {
-                    unified_diff: String::new(),
+                    unified_diff,
                     move_path: None,
                 },
             )]),
@@ -5713,11 +5756,52 @@ mod tests {
             .await
             .map_err(anyhow::Error::msg)?;
 
-        assert_eq!(fs::read_to_string(&file_path)?, "old\n");
+        assert_eq!(fs::read_to_string(&file_path)?, "new\n");
         let requests = client.write_text_file_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].path, file_path);
         assert_eq!(requests[0].content, "new\n");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pending_patch_replay_skips_update_when_file_changed_again() -> anyhow::Result<()>
+    {
+        let temp_dir = test_temp_dir("replay-update-changed-again");
+        let file_path = temp_dir.join("file.txt");
+        fs::write(&file_path, "old\n")?;
+        let unified_diff = diffy::create_patch("old\n", "new\n").to_string();
+
+        let pending = PendingPatchReplay::capture(
+            &temp_dir,
+            &HashMap::from([(
+                file_path.clone(),
+                FileChange::Update {
+                    unified_diff,
+                    move_path: None,
+                },
+            )]),
+        );
+
+        fs::write(&file_path, "changed again\n")?;
+
+        let client = Arc::new(StubClient::new());
+        let session_client = test_session_client(client.clone(), true);
+        let skipped = pending
+            .replay(&session_client)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(fs::read_to_string(&file_path)?, "changed again\n");
+        assert!(client.write_text_file_requests.lock().unwrap().is_empty());
+        assert_eq!(
+            skipped,
+            vec![PendingPatchReplaySkip {
+                path: file_path,
+                reason: "file changed again after patch apply; ACP replay skipped".to_string(),
+            }]
+        );
 
         Ok(())
     }
@@ -5747,10 +5831,7 @@ mod tests {
             .await
             .map_err(anyhow::Error::msg)?;
 
-        assert!(
-            !file_path.exists(),
-            "new file should be reverted before ACP replay"
-        );
+        assert_eq!(fs::read_to_string(&file_path)?, "new file\n");
         let requests = client.write_text_file_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].path, file_path);
@@ -5764,13 +5845,14 @@ mod tests {
         let temp_dir = test_temp_dir("replay-no-fs");
         let file_path = temp_dir.join("file.txt");
         fs::write(&file_path, "old\n")?;
+        let unified_diff = diffy::create_patch("old\n", "new\n").to_string();
 
         let pending = PendingPatchReplay::capture(
             &temp_dir,
             &HashMap::from([(
                 file_path.clone(),
                 FileChange::Update {
-                    unified_diff: String::new(),
+                    unified_diff,
                     move_path: None,
                 },
             )]),
@@ -5797,13 +5879,14 @@ mod tests {
         let outside_dir = test_temp_dir("replay-outside");
         let outside_path = outside_dir.join("outside.txt");
         fs::write(&outside_path, "old\n")?;
+        let unified_diff = diffy::create_patch("old\n", "new\n").to_string();
 
         let pending = PendingPatchReplay::capture(
             &temp_dir,
             &HashMap::from([(
                 outside_path.clone(),
                 FileChange::Update {
-                    unified_diff: String::new(),
+                    unified_diff,
                     move_path: None,
                 },
             )]),
@@ -5836,13 +5919,14 @@ mod tests {
             "../{}/outside.txt",
             outside_dir.file_name().unwrap().to_string_lossy()
         ));
+        let unified_diff = diffy::create_patch("old\n", "new\n").to_string();
 
         let pending = PendingPatchReplay::capture(
             &temp_dir,
             &HashMap::from([(
                 relative_escape,
                 FileChange::Update {
-                    unified_diff: String::new(),
+                    unified_diff,
                     move_path: None,
                 },
             )]),
@@ -5884,12 +5968,13 @@ mod tests {
         create_dir_symlink(&outside_dir, &link_path)?;
 
         let escaped_path = PathBuf::from("link/outside.txt");
+        let unified_diff = diffy::create_patch("old\n", "new\n").to_string();
         let pending = PendingPatchReplay::capture(
             &temp_dir,
             &HashMap::from([(
                 escaped_path,
                 FileChange::Update {
-                    unified_diff: String::new(),
+                    unified_diff,
                     move_path: None,
                 },
             )]),
@@ -5955,7 +6040,7 @@ mod tests {
             &HashMap::from([(
                 source_path.clone(),
                 FileChange::Update {
-                    unified_diff: String::new(),
+                    unified_diff: diffy::create_patch("old\n", "new\n").to_string(),
                     move_path: Some(temp_dir.join("dest.txt")),
                 },
             )]),
